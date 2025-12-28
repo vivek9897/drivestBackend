@@ -65,6 +65,12 @@ export class User {
   @Column({ type: 'timestamptz', nullable: true })
   safetyAcceptedAt?: Date | null;
 
+  @Column({ type: 'varchar', nullable: true })
+  activeDeviceId?: string | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  activeDeviceAt?: Date | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

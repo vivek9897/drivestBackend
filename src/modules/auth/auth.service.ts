@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   UnauthorizedException,
@@ -23,6 +24,9 @@ export class AuthService {
   ) {}
 
   async register(dto: RegisterDto) {
+    if (!dto.deviceId) {
+      throw new BadRequestException('Device ID required');
+    }
     const existing = await this.usersRepo.findOne({ where: { email: dto.email } });
     if (existing) {
       throw new ConflictException('Email already registered');
@@ -34,6 +38,8 @@ export class AuthService {
       phone: dto.phone ?? null,
       passwordHash,
       role: 'USER',
+      activeDeviceId: dto.deviceId,
+      activeDeviceAt: new Date(),
     });
     await this.usersRepo.save(user);
     await this.ensureWhitelistedEntitlement(user);
@@ -48,7 +54,7 @@ export class AuthService {
   async validateUser(email: string, password: string): Promise<User> {
     const user = await this.usersRepo.findOne({
       where: { email },
-      select: ['id', 'email', 'name', 'passwordHash', 'role'],
+      select: ['id', 'email', 'name', 'passwordHash', 'role', 'activeDeviceId'],
     });
     if (!user) throw new UnauthorizedException('Invalid credentials');
     const match = await bcrypt.compare(password, user.passwordHash);
@@ -57,7 +63,18 @@ export class AuthService {
   }
 
   async login(dto: LoginDto) {
+    if (!dto.deviceId) {
+      throw new BadRequestException('Device ID required');
+    }
     const user = await this.validateUser(dto.email, dto.password);
+    if (user.activeDeviceId && user.activeDeviceId !== dto.deviceId) {
+      throw new UnauthorizedException('Account is linked to another device');
+    }
+    if (!user.activeDeviceId) {
+      user.activeDeviceId = dto.deviceId;
+      user.activeDeviceAt = new Date();
+      await this.usersRepo.save(user);
+    }
     await this.ensureWhitelistedEntitlement(user);
     return this.buildToken(user);
   }

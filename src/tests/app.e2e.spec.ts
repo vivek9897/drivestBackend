@@ -99,13 +99,13 @@ describe('Route Master API (e2e)', () => {
   it('registers and logs in', async () => {
     const register = await request(app.getHttpServer())
       .post('/auth/register')
-      .send({ email: 'test@example.com', password: 'password', name: 'Test User' })
+      .send({ email: 'test@example.com', password: 'password', name: 'Test User', deviceId: 'device-1' })
       .expect(201);
     expect(register.body.data.accessToken).toBeDefined();
 
     const login = await request(app.getHttpServer())
       .post('/auth/login')
-      .send({ email: 'test@example.com', password: 'password' })
+      .send({ email: 'test@example.com', password: 'password', deviceId: 'device-1' })
       .expect(200);
     expect(login.body.data.accessToken).toBeDefined();
   });
@@ -113,7 +113,7 @@ describe('Route Master API (e2e)', () => {
   it('blocks download without entitlement', async () => {
     const register = await request(app.getHttpServer())
       .post('/auth/register')
-      .send({ email: 'ent@example.com', password: 'password', name: 'Ent User' });
+      .send({ email: 'ent@example.com', password: 'password', name: 'Ent User', deviceId: 'device-2' });
     const token = register.body.data.accessToken;
 
     const centre = await centreRepo.save({
@@ -141,23 +141,26 @@ describe('Route Master API (e2e)', () => {
     await request(app.getHttpServer())
       .get(`/routes/${route.id}/download`)
       .set('Authorization', `Bearer ${token}`)
+      .set('x-device-id', 'device-2')
       .expect(403);
   });
 
   it('enforces cashback once per lifetime', async () => {
     const register = await request(app.getHttpServer())
       .post('/auth/register')
-      .send({ email: 'cash@example.com', password: 'password', name: 'Cash User' });
+      .send({ email: 'cash@example.com', password: 'password', name: 'Cash User', deviceId: 'device-3' });
     const token = register.body.data.accessToken;
 
     await request(app.getHttpServer())
       .post('/cashback/start')
       .set('Authorization', `Bearer ${token}`)
+      .set('x-device-id', 'device-3')
       .expect(201);
 
     await request(app.getHttpServer())
       .post('/cashback/start')
       .set('Authorization', `Bearer ${token}`)
+      .set('x-device-id', 'device-3')
       .expect(409);
   });
 

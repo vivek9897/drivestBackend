@@ -14,4 +14,7 @@ export class RegisterDto {
   @IsOptional()
   @IsString()
   phone?: string;
+
+  @IsString()
+  deviceId: string;
 }
