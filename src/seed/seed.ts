@@ -3,6 +3,9 @@ import dataSource from '../database/typeorm.config';
 import { TestCentre } from '../entities/test-centre.entity';
 import { Route, RouteDifficulty } from '../entities/route.entity';
 import { Product, ProductPeriod, ProductType } from '../entities/product.entity';
+import { OsmSpeedService } from '../modules/routes/osm-speed.service';
+import { inferSpeedFromRoadClassMph } from '../modules/routes/speed-fallback';
+import { computeBendAdvisoryMph } from '../modules/routes/advisory-speed';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -15,7 +18,6 @@ const coordsFromGeoJson = (geojson: any): number[][] => {
 
 const coordsFromGpx = (gpx?: string): number[][] => {
   if (!gpx) return [];
-  // Prefer the longest <trkseg> in the GPX to avoid mixing multiple tracks
   const segRegex = /<trkseg[^>]*>([\s\S]*?)<\/trkseg>/gi;
   let segMatch: RegExpExecArray | null;
   let best: number[][] = [];
@@ -25,19 +27,18 @@ const coordsFromGpx = (gpx?: string): number[][] => {
     const ptRegex = /<trkpt[^>]*lat="([0-9.+-]+)"[^>]*lon="([0-9.+-]+)"/g;
     let ptMatch: RegExpExecArray | null;
     while ((ptMatch = ptRegex.exec(seg)) !== null) {
-      pts.push([Number(ptMatch[2]), Number(ptMatch[1])]); // [lng, lat]
+      pts.push([Number(ptMatch[2]), Number(ptMatch[1])]);
     }
     if (pts.length > best.length) best = pts;
   }
 
   if (best.length) return best;
 
-  // Fallback: all points in file
   const fallbackPts: number[][] = [];
   const fallbackRegex = /<trkpt[^>]*lat="([0-9.+-]+)"[^>]*lon="([0-9.+-]+)"/g;
   let match: RegExpExecArray | null;
   while ((match = fallbackRegex.exec(gpx)) !== null) {
-    fallbackPts.push([Number(match[2]), Number(match[1])]); // [lng, lat]
+    fallbackPts.push([Number(match[2]), Number(match[1])]);
   }
   return fallbackPts;
 };
@@ -81,17 +82,315 @@ const distanceMeters = (coords: number[][]) => {
   return Math.round(dist);
 };
 
+const firstExistingPath = (candidates: string[]) => {
+  for (const p of candidates) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  return null;
+};
+
+const resolveSeedRoutesDir = () => {
+  const cwd = process.cwd();
+  const candidates = [
+    path.resolve(cwd, 'src/seed/routes'),
+    path.resolve(cwd, 'dist/seed/routes'),
+    path.resolve(__dirname, 'routes'),
+  ];
+  return firstExistingPath(candidates);
+};
+
+const resolveSeedFile = (relativeFromRoutesDir: string) => {
+  const cwd = process.cwd();
+  const candidates = [
+    path.resolve(cwd, 'src/seed/routes', relativeFromRoutesDir),
+    path.resolve(cwd, 'dist/seed/routes', relativeFromRoutesDir),
+    path.resolve(__dirname, 'routes', relativeFromRoutesDir),
+  ];
+  return firstExistingPath(candidates);
+};
+
+const pickCoordForInstruction = (coords: number[][], idx: number, total: number) => {
+  if (!coords?.length) return null;
+  if (total <= 1) return coords[0];
+
+  if (idx === 0) return coords[Math.min(10, coords.length - 1)];
+  if (idx === total - 1) return coords[Math.max(0, coords.length - 11)];
+
+  const t = idx / (total - 1);
+  const pos = Math.max(0, Math.min(coords.length - 1, Math.round(t * (coords.length - 1))));
+  return coords[pos];
+};
+
+const applyOsmSpeedsToInstructions = async (
+  osmSpeedService: OsmSpeedService,
+  coords: number[][],
+  instructions: any[],
+) => {
+  if (!Array.isArray(instructions) || !instructions.length) return;
+
+  const radiusM = 120;
+
+  for (let i = 0; i < instructions.length; i++) {
+    const ins = instructions[i];
+    const c = pickCoordForInstruction(coords, i, instructions.length);
+    if (!c) continue;
+
+    const lng = c[0];
+    const lat = c[1];
+
+    const speed = await osmSpeedService.getSpeedAtPoint(lng, lat, radiusM);
+
+    ins.snapped_to_road = !!speed.snapped;
+    ins.snap_distance_m = speed.snapped?.dist_m ?? null;
+
+    if (speed.matched?.highway) {
+      ins.road_class = speed.matched.highway;
+    }
+
+    // 1) Use OSM speed if available
+    if (speed.mph != null) {
+      ins.speed_limit_mph_osm = speed.speed_source.startsWith('osm') ? speed.mph : null;
+      ins.speed_mph = speed.mph;
+      ins.speed_limit_mph_final = speed.mph;
+      ins.speed_source = speed.speed_source;
+      ins.speed_limit_confidence = speed.speed_limit_confidence;
+    }
+
+    // 2) Fallback: infer from road class if OSM speed missing
+    if (speed.mph == null) {
+      const inferred = inferSpeedFromRoadClassMph(ins.road_class);
+      if (inferred != null) {
+        ins.speed_limit_mph_osm = null;
+        ins.speed_mph = inferred;
+        ins.speed_limit_mph_final = inferred;
+        ins.speed_source = 'inferred_roadclass';
+        ins.speed_limit_confidence = Math.max(Number(ins.speed_limit_confidence ?? 0), 0.6);
+      }
+    }
+
+    if (!Array.isArray(ins.hazard_tags)) ins.hazard_tags = [];
+    if (!Array.isArray(ins.common_fault_risk)) ins.common_fault_risk = [];
+
+    const advisory = computeAdvisorySpeedMph(coords, i, instructions.length, ins);
+    if (advisory != null) {
+      ins.advisory_speed_mph = advisory;
+
+      const base = Number(ins.speed_mph ?? ins.speed_limit_mph_final ?? 0);
+      if (base && advisory <= base - 10) {
+        ins.speed_drop_warning = true;
+      }
+    }
+
+    const controls = await osmSpeedService.findControlsNearPoint(lng, lat, 60, 5);
+    ins.nearest_control = controls?.length ? controls[0] : null;
+    applyControlTags(ins, controls);
+
+
+    ins.step_reliability_score = computeReliability(ins);
+    ins.step_reliability_label = reliabilityLabel(ins.step_reliability_score);
+  }
+};
+
+const computeAdvisorySpeedMph = (coords: number[][], idx: number, total: number, ins: any): number | null => {
+  if (!coords?.length) return null;
+
+  const c = pickCoordForInstruction(coords, idx, total);
+  if (!c) return null;
+
+  const pos = nearestCoordIndex(coords, c);
+  if (pos < 2 || pos > coords.length - 3) return null;
+
+  const a = coords[pos - 2];
+  const b = coords[pos];
+  const d = coords[pos + 2];
+
+  const ang = turnAngleDeg(a, b, d);
+  const abs = Math.abs(ang);
+
+  const text = String(ins?.direction ?? '').toLowerCase();
+  const type = String(ins?.action_type ?? '').toLowerCase();
+
+  const isRoundabout = text.includes('roundabout') || type.includes('roundabout');
+
+  if (isRoundabout) {
+  const dir = String(ins?.direction ?? '').toLowerCase();
+
+  const m = dir.match(/(\d+)\s*(st|nd|rd|th)\s*(exit|left|right)/i);
+  const exitN = m ? Number(m[1]) : null;
+
+  if (exitN != null) {
+    if (exitN >= 4) return 12;
+    if (exitN === 3) return 14;
+    return 15;
+  }
+
+  return 15;
+}
+
+  let angleAdvisory: number | null = null;
+  if (abs >= 80) angleAdvisory = 10;
+  else if (abs >= 60) angleAdvisory = 15;
+  else if (abs >= 40) angleAdvisory = 20;
+  else if (abs >= 25) angleAdvisory = 25;
+
+  const sliceStart = Math.max(0, pos - 6);
+  const sliceEnd = Math.min(coords.length, pos + 7);
+  const slice = coords.slice(sliceStart, sliceEnd);
+
+  const geom = slice.map((p) => ({ lon: p[0], lat: p[1] }));
+  const bendAdvisory = computeBendAdvisoryMph(geom, { sampleStep: 1 });
+
+  if (bendAdvisory == null) return angleAdvisory;
+  if (angleAdvisory == null) return bendAdvisory;
+
+  return Math.min(angleAdvisory, bendAdvisory);
+};
+
+const applyControlTags = (ins: any, hits: Array<{ type: string; dist_m: number }>) => {
+  if (!hits?.length) return;
+
+  const nearest = hits[0];
+  const t = nearest.type;
+
+  if (!Array.isArray(ins.hazard_tags)) ins.hazard_tags = [];
+  if (!Array.isArray(ins.common_fault_risk)) ins.common_fault_risk = [];
+
+  if (t === 'traffic_signals') {
+  const d = Number(nearest.dist_m ?? 999);
+
+  if (!ins.hazard_tags.includes('traffic_lights')) ins.hazard_tags.push('traffic_lights');
+
+  ins.junction_type = 'traffic_lights';
+  ins.decision_point = d <= 30;
+  ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), d <= 15 ? 3 : 2);
+
+  if (!ins.common_fault_risk.includes('signal_observation')) ins.common_fault_risk.push('signal_observation');
+  if (d <= 20 && !ins.common_fault_risk.includes('stop_line')) ins.common_fault_risk.push('stop_line');
+
+  ins.stop_line_expected = d <= 20;
+
+  return;
+}
+
+  if (t === 'stop') {
+  const d = Number(nearest.dist_m ?? 999);
+
+  if (!ins.hazard_tags.includes('stop')) ins.hazard_tags.push('stop');
+
+  ins.junction_type = 'stop';
+  ins.decision_point = d <= 30;
+  ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), 3);
+
+  if (!ins.common_fault_risk.includes('stop_line')) ins.common_fault_risk.push('stop_line');
+
+  ins.stop_line_expected = true;
+  ins.must_stop = d <= 30;
+
+  return;
+}
+
+  if (t === 'give_way') {
+    if (!ins.hazard_tags.includes('give_way')) ins.hazard_tags.push('give_way');
+    ins.junction_type = ins.junction_type ?? 'give_way';
+    ins.decision_point = true;
+    ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), 2);
+    if (!ins.common_fault_risk.includes('give_way')) ins.common_fault_risk.push('give_way');
+  }
+};
+
+const computeReliability = (ins: any): number => {
+  const src = String(ins?.speed_source ?? '');
+  const snap = ins?.snapped_to_road === true;
+  const snapM = Number(ins?.snap_distance_m ?? 999);
+
+  let s = 0.65;
+
+  if (src === 'osm' || src === 'osm_nsl') s = 0.9;
+  if (src === 'osm_nearby') s = 0.82;
+  if (src === 'inferred_roadclass') s = 0.72;
+
+  if (snap) {
+    if (snapM <= 5) s += 0.05;
+    else if (snapM <= 15) s += 0.02;
+    else if (snapM >= 40) s -= 0.05;
+  } else {
+    s -= 0.1;
+  }
+
+  if (ins?.hazard_tags?.includes('traffic_lights')) s -= 0.02;
+  if (ins?.hazard_tags?.includes('stop')) s -= 0.03;
+
+  const advisory = Number(ins?.advisory_speed_mph ?? 0);
+  const base = Number(ins?.speed_limit_mph_final ?? ins?.speed_mph ?? 0);
+
+  if (advisory > 0 && base > 0) {
+    const drop = base - advisory;
+
+    if (drop >= 20) s -= 0.08;
+    else if (drop >= 15) s -= 0.05;
+    else if (drop >= 10) s -= 0.03;
+  }
+
+  if (s < 0) s = 0;
+  if (s > 1) s = 1;
+  return Number(s.toFixed(3));
+};
+
+const reliabilityLabel = (v: number) => {
+  if (v >= 0.85) return 'high';
+  if (v >= 0.7) return 'medium';
+  return 'low';
+};
+
+const nearestCoordIndex = (coords: number[][], target: number[]) => {
+  let bestI = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < coords.length; i++) {
+    const dx = coords[i][0] - target[0];
+    const dy = coords[i][1] - target[1];
+    const d = dx * dx + dy * dy;
+    if (d < bestD) {
+      bestD = d;
+      bestI = i;
+    }
+  }
+  return bestI;
+};
+
+const turnAngleDeg = (a: number[], b: number[], c: number[]) => {
+  const v1x = a[0] - b[0];
+  const v1y = a[1] - b[1];
+  const v2x = c[0] - b[0];
+  const v2y = c[1] - b[1];
+
+  const dot = v1x * v2x + v1y * v2y;
+  const m1 = Math.sqrt(v1x * v1x + v1y * v1y);
+  const m2 = Math.sqrt(v2x * v2x + v2y * v2y);
+
+  if (!m1 || !m2) return 0;
+
+  let cos = dot / (m1 * m2);
+  if (cos > 1) cos = 1;
+  if (cos < -1) cos = -1;
+
+  const ang = Math.acos(cos) * (180 / Math.PI);
+  return 180 - ang;
+};
+
 async function run() {
   await dataSource.initialize();
+
+  const osmSpeedService = new OsmSpeedService(dataSource);
+
   const centreRepo = dataSource.getRepository(TestCentre);
   const routeRepo = dataSource.getRepository(Route);
   const productRepo = dataSource.getRepository(Product);
 
-  // Clean tables in FK-safe order
-  await routeRepo.query('TRUNCATE practice_sessions, route_stats, tracks, cashback_claims, routes RESTART IDENTITY CASCADE');
+  await routeRepo.query(
+    'TRUNCATE practice_sessions, route_stats, tracks, cashback_claims, routes RESTART IDENTITY CASCADE',
+  );
   await centreRepo.query('TRUNCATE test_centres RESTART IDENTITY CASCADE');
   await productRepo.query('TRUNCATE purchases, entitlements, products RESTART IDENTITY CASCADE');
-
 
   const centres: Partial<TestCentre>[] = [
     {
@@ -107,7 +406,6 @@ async function run() {
 
   const savedCentres: TestCentre[] = [];
   for (const centre of centres) {
-    // Insert with raw geo expression then reload the row
     const insertResult = await centreRepo.query(
       `INSERT INTO test_centres (name, address, postcode, city, country, lat, lng, geo)
        VALUES ($1, $2, $3, $4, $5, $6, $7, ST_SetSRID(ST_MakePoint($7, $6), 4326))
@@ -119,26 +417,31 @@ async function run() {
 
   const colchesterRouteCoords: number[][] = [];
 
-  // Optional: load additional routes from files in src/seed/routes
-  const routesDir = path.join(__dirname, 'routes');
-  if (fs.existsSync(routesDir)) {
+  const payloadFile = resolveSeedFile('colchester_payload.json');
+  const payloadJson: any[] | null =
+    payloadFile && fs.existsSync(payloadFile) ? JSON.parse(fs.readFileSync(payloadFile, 'utf8')) : null;
+
+  const routesDir = resolveSeedRoutesDir();
+  if (routesDir && fs.existsSync(routesDir)) {
     const files = fs.readdirSync(routesDir);
     const gpxFiles = files.filter((f) => f.toLowerCase().endsWith('.gpx'));
+
     for (const gpxFile of gpxFiles) {
       try {
         const gpxPath = path.join(routesDir, gpxFile);
         const gpxContent = fs.readFileSync(gpxPath, 'utf8');
-        const base = gpxFile.replace(/\\.gpx$/i, '');
-        const routeNumberMatch = base.match(/(\\d+)/);
+        const base = gpxFile.replace(/\.gpx$/i, '');
+        const routeNumberMatch = base.match(/(\d+)/);
         const routeNumber = routeNumberMatch ? routeNumberMatch[1] : null;
-        const routeName = routeNumber
-          ? `Colchester Test Route ${routeNumber}`
-          : 'Colchester Test Route';
+
+        const routeName = routeNumber ? `Colchester Test Route ${routeNumber}` : 'Colchester Test Route';
+
         const geojsonPath = path.join(routesDir, `${base}.geojson`);
         let geojsonContent: any = null;
         if (fs.existsSync(geojsonPath)) {
           geojsonContent = JSON.parse(fs.readFileSync(geojsonPath, 'utf8'));
         }
+
         let coords: number[][] = [];
         if (geojsonContent) coords = coordsFromGeoJson(geojsonContent);
         if (!coords.length) coords = coordsFromGpx(gpxContent);
@@ -146,6 +449,7 @@ async function run() {
 
         const bboxLocal = computeBbox(coords);
         const polyline = JSON.stringify(coords);
+
         const geojsonToStore =
           geojsonContent ||
           (coords.length
@@ -162,7 +466,16 @@ async function run() {
             : null);
 
         const dist = distanceMeters(coords);
-        const duration = Math.round(dist / (30 * (1000 / 3600))); // 30 km/h estimate
+        const duration = Math.round(dist / (30 * (1000 / 3600)));
+
+        const routePayload =
+          payloadJson && routeNumber
+            ? payloadJson.find((r: any) => r.route === Number(routeNumber)) ?? null
+            : null;
+
+        if (routePayload?.instructions && coords.length) {
+          await applyOsmSpeedsToInstructions(osmSpeedService, coords, routePayload.instructions);
+        }
 
         await routeRepo.save({
           centreId: savedCentres[0].id,
@@ -174,17 +487,20 @@ async function run() {
           geojson: geojsonToStore,
           gpx: gpxContent,
           bbox: bboxLocal,
+          payload: routePayload,
           version: 1,
           isActive: true,
         } as Route);
+
         console.log(`Loaded GPX route from ${gpxFile} with ${coords.length} points`);
       } catch (err) {
         console.warn(`Failed to load route from ${gpxFile}:`, err);
       }
     }
+  } else {
+    console.warn('Seed routes directory not found');
   }
 
-  // Products: centre pack + centre-scoped subscriptions
   const centreProduct: Partial<Product> = {
     type: ProductType.CENTRE_PACK,
     pricePence: 1000,
@@ -225,9 +541,8 @@ async function run() {
     metadata: { centreId: savedCentres[0].id, scope: 'CENTRE' },
   };
 
-  await productRepo.save(
-    [centreProduct, weeklySubscription, monthlySubscription, quarterSubscription] as Product[],
-  );
+  await productRepo.save([centreProduct, weeklySubscription, monthlySubscription, quarterSubscription] as Product[]);
+
   console.log('Seed complete');
   await dataSource.destroy();
 }

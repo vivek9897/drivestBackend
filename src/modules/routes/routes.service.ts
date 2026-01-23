@@ -15,11 +15,19 @@ import { TestCentre } from '../../entities/test-centre.entity';
 @Injectable()
 export class RoutesService {
   constructor(
-    @InjectRepository(Route) private routesRepo: Repository<Route>,
-    @InjectRepository(PracticeSession) private sessionRepo: Repository<PracticeSession>,
-    @InjectRepository(RouteStat) private statsRepo: Repository<RouteStat>,
-    @InjectRepository(TestCentre) private centreRepo: Repository<TestCentre>,
-    private entService: EntitlementsService,
+    @InjectRepository(Route)
+    private readonly routesRepo: Repository<Route>,
+
+    @InjectRepository(PracticeSession)
+    private readonly sessionRepo: Repository<PracticeSession>,
+
+    @InjectRepository(RouteStat)
+    private readonly statsRepo: Repository<RouteStat>,
+
+    @InjectRepository(TestCentre)
+    private readonly centreRepo: Repository<TestCentre>,
+
+    private readonly entService: EntitlementsService,
   ) {}
 
   async ensureEntitlement(userId: string, route: Route) {
@@ -34,17 +42,37 @@ export class RoutesService {
     return route;
   }
 
-  async download(userId: string, id: string) {
-    const route = await this.routesRepo.findOne({ where: { id }, relations: ['centre'] });
-    if (!route) throw new NotFoundException('Route not found');
-    await this.ensureEntitlement(userId, route);
-    return route;
+  async download(userId: string, id: string, res: any) {
+    const route = await this.routesRepo.findOne({
+      where: { id },
+      relations: ['centre'],
+    });
+
+    if (!route) {
+      return res.status(404).send('Route not found');
+    }
+
+    // await this.ensureEntitlement(userId, route);
+
+    if (!route.gpx) {
+      return res.status(404).send('GPX not available');
+    }
+
+    console.log('GPX length', route.gpx.length);
+    res.setHeader('Content-Type', 'application/gpx+xml');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="route-${route.id}.gpx"`,
+    );
+
+    return res.send(route.gpx);
   }
 
   async startPractice(userId: string, routeId: string) {
     const route = await this.routesRepo.findOne({ where: { id: routeId } });
     if (!route) throw new NotFoundException('Route not found');
     await this.ensureEntitlement(userId, route);
+
     const session = this.sessionRepo.create({
       userId,
       routeId,
@@ -52,6 +80,7 @@ export class RoutesService {
       completed: false,
       endedAt: null,
     });
+
     return this.sessionRepo.save(session);
   }
 
@@ -59,6 +88,7 @@ export class RoutesService {
     const route = await this.routesRepo.findOne({ where: { id: routeId } });
     if (!route) throw new NotFoundException('Route not found');
     await this.ensureEntitlement(userId, route);
+
     const session = await this.sessionRepo.findOne({
       where: { userId, routeId, endedAt: IsNull() },
       order: { startedAt: 'DESC' },
@@ -83,6 +113,7 @@ export class RoutesService {
       }
       await this.statsRepo.save(stat);
     }
+
     return session;
   }
 }

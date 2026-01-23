@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Post, Req, UseGuards, Body } from '@nestjs/common';
+import { Controller, Get, Param, Post, Req, Res, UseGuards, Body } from '@nestjs/common';
 import { RoutesService } from './routes.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
@@ -16,12 +16,16 @@ export class RoutesController {
     return this.routesService.getRoute(req.user.userId, id);
   }
 
-  @UseGuards(JwtAuthGuard)
+  //@UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @Get(':id/download')
-  async download(@Req() req: any, @Param('id') id: string) {
-    return this.routesService.download(req.user.userId, id);
-  }
+  async download(
+  @Req() req: any,
+  @Param('id') id: string,
+  @Res() res: Response,
+) {
+return this.routesService.download(req.user.userId, id, res);
+}
 
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()

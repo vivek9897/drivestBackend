@@ -65,6 +65,12 @@ export class Route {
   @Column({ type: 'varchar', length: 64, nullable: true })
   gpxHash: string | null;
 
+  @Column({
+    type: process.env.NODE_ENV === 'test' ? 'simple-json' : 'jsonb',
+    nullable: true,
+  } as any)
+  payload: any | null;
+
   @Column('int')
   version: number;
 
