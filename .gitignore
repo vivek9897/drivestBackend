@@ -12,3 +12,16 @@ pnpm-debug.log*
 tmp/
 .cache/
 *.tsbuildinfo
+demo_backend.ps1
+latest_route_payload.json
+login.json
+register.json
+grant.sql
+grant_download.sql
+package.zip
+
+route.gpx
+route_*.json
+
+src/seed/routes/*.gpx
+src/seed/routes/zebra_*.json
