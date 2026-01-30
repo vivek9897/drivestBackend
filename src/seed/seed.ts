@@ -111,6 +111,13 @@ const resolveSeedFile = (relativeFromRoutesDir: string) => {
 
 const pickCoordForInstruction = (coords: number[][], idx: number, total: number) => {
   if (!coords?.length) return null;
+
+  if (coords.length < 30) {
+    const t = total <= 1 ? 0 : idx / (total - 1);
+    const pos = Math.max(0, Math.min(coords.length - 1, Math.round(t * (coords.length - 1))));
+    return coords[pos];
+  }
+
   if (total <= 1) return coords[0];
 
   if (idx === 0) return coords[Math.min(10, coords.length - 1)];
@@ -121,6 +128,27 @@ const pickCoordForInstruction = (coords: number[][], idx: number, total: number)
   return coords[pos];
 };
 
+const densifyCoords = (coords: number[][], stepM = 10): number[][] => {
+  const result: number[][] = [];
+  for (let i = 0; i < coords.length - 1; i++) {
+    const a = coords[i];
+    const b = coords[i + 1];
+    const dist = haversine(a, b);
+    result.push(a);
+    if (dist > stepM) {
+      const numSteps = Math.floor(dist / stepM);
+      for (let j = 1; j <= numSteps; j++) {
+        const frac = j / (numSteps + 1);
+        const lng = a[0] + frac * (b[0] - a[0]);
+        const lat = a[1] + frac * (b[1] - a[1]);
+        result.push([lng, lat]);
+      }
+    }
+  }
+  if (coords.length) result.push(coords[coords.length - 1]);
+  return result;
+};
+
 const applyOsmSpeedsToInstructions = async (
   osmSpeedService: OsmSpeedService,
   coords: number[][],
@@ -128,17 +156,25 @@ const applyOsmSpeedsToInstructions = async (
 ) => {
   if (!Array.isArray(instructions) || !instructions.length) return;
 
-  const radiusM = 120;
-
   for (let i = 0; i < instructions.length; i++) {
     const ins = instructions[i];
     const c = pickCoordForInstruction(coords, i, instructions.length);
     if (!c) continue;
 
+    ins.lat = c[1];
+    ins.lon = c[0];
+    ins.location = { lat: c[1], lon: c[0] };
+
     const lng = c[0];
     const lat = c[1];
 
-    const speed = await osmSpeedService.getSpeedAtPoint(lng, lat, radiusM);
+    let speed = await osmSpeedService.getSpeedAtPoint(lng, lat, 150);
+    if (speed.mph == null) {
+      const snapM = Number(speed.snapped?.dist_m ?? 999);
+      if (speed.snapped && snapM <= 15) {
+        speed = await osmSpeedService.getSpeedAtPoint(lng, lat, 500);
+      }
+    }
 
     ins.snapped_to_road = !!speed.snapped;
     ins.snap_distance_m = speed.snapped?.dist_m ?? null;
@@ -146,6 +182,8 @@ const applyOsmSpeedsToInstructions = async (
     if (speed.matched?.highway) {
       ins.road_class = speed.matched.highway;
     }
+
+    applyRoundaboutTags(ins);
 
     // 1) Use OSM speed if available
     if (speed.mph != null) {
@@ -181,10 +219,61 @@ const applyOsmSpeedsToInstructions = async (
       }
     }
 
-    const controls = await osmSpeedService.findControlsNearPoint(lng, lat, 60, 5);
+    let radius = 60;
+    let limit = 5;
+    if (ins.direction && (ins.direction.includes('t/l') || ins.direction.includes('traffic lights'))) {
+      radius = 300;
+      limit = 8;
+    }
+    const controls = await osmSpeedService.findControlsNearPoint(lng, lat, radius, limit);
     ins.nearest_control = controls?.length ? controls[0] : null;
+    if (!controls || controls.length === 0) {
+        ins.nearest_control = null;
+    }
     applyControlTags(ins, controls);
 
+    ins['nearest_control'] = (controls && controls.length) ? controls[0] : null;
+
+    const pos = nearestCoordIndex(coords, c);
+    const windowStart = Math.max(0, pos - 25);
+    const windowEnd = Math.min(coords.length, pos + 26);
+    const windowCoords = coords.slice(windowStart, windowEnd);
+    const densified = densifyCoords(windowCoords, 10);
+    let bestZebra: any = null;
+    let bestDist = Infinity;
+    for (const point of densified) {
+      const lngP = point[0];
+      const latP = point[1];
+      const zebras = await osmSpeedService.findZebraCrossingsNearPoint(lngP, latP, 60, 8);
+      if (zebras.length) {
+        const nearest = zebras[0];
+        if (nearest.dist_m < bestDist) {
+          bestDist = nearest.dist_m;
+          bestZebra = nearest;
+        }
+      }
+    }
+    ins.nearest_zebra_crossing = bestDist <= 40 ? bestZebra : null;
+
+    // Force instruction-level zebra fields from the best zebra we found
+    if (ins.nearest_zebra_crossing) {
+      const d = Number(ins.nearest_zebra_crossing?.dist_m ?? null)
+      ins.zebra_crossing_dist_m = Number.isFinite(d) ? d : null
+
+      if (ins.zebra_crossing_dist_m !== null) {
+        if (ins.zebra_crossing_dist_m <= 15) ins.zebra_crossing_confidence = 0.9
+        else if (ins.zebra_crossing_dist_m <= 30) ins.zebra_crossing_confidence = 0.7
+        else if (ins.zebra_crossing_dist_m <= 60) ins.zebra_crossing_confidence = 0.5
+        else ins.zebra_crossing_confidence = 0.3
+      } else {
+        ins.zebra_crossing_confidence = null
+      }
+    } else {
+      ins.zebra_crossing_dist_m = null
+      ins.zebra_crossing_confidence = null
+    }
+
+    applyZebraTags(ins);
 
     ins.step_reliability_score = computeReliability(ins);
     ins.step_reliability_label = reliabilityLabel(ins.step_reliability_score);
@@ -213,19 +302,30 @@ const computeAdvisorySpeedMph = (coords: number[][], idx: number, total: number,
   const isRoundabout = text.includes('roundabout') || type.includes('roundabout');
 
   if (isRoundabout) {
-  const dir = String(ins?.direction ?? '').toLowerCase();
+    const dir = String(ins?.direction ?? '').toLowerCase();
 
-  const m = dir.match(/(\d+)\s*(st|nd|rd|th)\s*(exit|left|right)/i);
-  const exitN = m ? Number(m[1]) : null;
+    let exitN: number | null = null;
 
-  if (exitN != null) {
-    if (exitN >= 4) return 12;
-    if (exitN === 3) return 14;
+    // Only treat numeric ordinals as true exits.
+    const m = dir.match(/(\d+)\s*(st|nd|rd|th)\s*exit/i);
+    if (m) {
+      exitN = Number(m[1]);
+    } else {
+      // Semantic fallback when text has no ordinal.
+      if (dir.includes('roundabout left')) exitN = 1;
+      else if (dir.includes('roundabout ahead') || dir.includes('roundabout straight')) exitN = 2;
+      else if (dir.includes('roundabout right')) exitN = 3;
+    }
+
+    if (exitN != null) {
+      if (exitN >= 4) return 12;
+      if (exitN === 3) return 14;
+      return 15;
+    }
+
+    // If we still don't know exit number, keep existing default advisory.
     return 15;
   }
-
-  return 15;
-}
 
   let angleAdvisory: number | null = null;
   if (abs >= 80) angleAdvisory = 10;
@@ -246,6 +346,63 @@ const computeAdvisorySpeedMph = (coords: number[][], idx: number, total: number,
   return Math.min(angleAdvisory, bendAdvisory);
 };
 
+const applyRoundaboutTags = (ins: any) => {
+  const dirRaw = String(ins?.direction ?? '');
+  const typeRaw = String(ins?.action_type ?? '');
+  const s = (dirRaw + ' ' + typeRaw).toLowerCase();
+
+  if (!s.includes('roundabout')) return;
+
+  if (!Array.isArray(ins.hazard_tags)) ins.hazard_tags = [];
+  if (!Array.isArray(ins.common_fault_risk)) ins.common_fault_risk = [];
+
+  if (!ins.hazard_tags.includes('roundabout')) ins.hazard_tags.push('roundabout');
+
+  ins.junction_type = 'roundabout';
+  ins.decision_point = true;
+  ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), 3);
+
+  // Exit logic: numeric ordinal first, else semantic left/ahead/right.
+  let exitN: number | null = null;
+  let inferred = false;
+  let confidence = 0;
+
+  const m = s.match(/(\d+)\s*(st|nd|rd|th)\s*exit/i);
+  if (m) {
+    exitN = Number(m[1]);
+    inferred = false;
+    confidence = 0.95;
+  } else {
+    if (s.includes('roundabout left')) {
+      exitN = 1;
+      inferred = true;
+      confidence = 0.75;
+    } else if (s.includes('roundabout ahead') || s.includes('roundabout straight')) {
+      exitN = 2;
+      inferred = true;
+      confidence = 0.7;
+    } else if (s.includes('roundabout right')) {
+      exitN = 3;
+      inferred = true;
+      confidence = 0.75;
+    }
+  }
+
+  if (exitN != null) {
+    ins.roundabout_exit = exitN;
+    ins.roundabout_exit_number_inferred = inferred;
+    ins.roundabout_exit_confidence = confidence;
+
+    if (!ins.common_fault_risk.includes('lane_discipline')) ins.common_fault_risk.push('lane_discipline');
+    if (!ins.common_fault_risk.includes('signals')) ins.common_fault_risk.push('signals');
+  } else {
+    // Do not overwrite if another part set it earlier
+    if (ins.roundabout_exit === undefined) ins.roundabout_exit = null;
+    if (ins.roundabout_exit_number_inferred === undefined) ins.roundabout_exit_number_inferred = false;
+    if (ins.roundabout_exit_confidence === undefined) ins.roundabout_exit_confidence = 0;
+  }
+};
+
 const applyControlTags = (ins: any, hits: Array<{ type: string; dist_m: number }>) => {
   if (!hits?.length) return;
 
@@ -256,38 +413,39 @@ const applyControlTags = (ins: any, hits: Array<{ type: string; dist_m: number }
   if (!Array.isArray(ins.common_fault_risk)) ins.common_fault_risk = [];
 
   if (t === 'traffic_signals') {
-  const d = Number(nearest.dist_m ?? 999);
+    const d = Number(nearest.dist_m ?? 999);
+    ins.traffic_lights_source = 'osm';
 
-  if (!ins.hazard_tags.includes('traffic_lights')) ins.hazard_tags.push('traffic_lights');
+    if (!ins.hazard_tags.includes('traffic_lights')) ins.hazard_tags.push('traffic_lights');
 
-  ins.junction_type = 'traffic_lights';
-  ins.decision_point = d <= 30;
-  ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), d <= 15 ? 3 : 2);
+    ins.junction_type = 'traffic_lights';
+    ins.decision_point = d <= 30;
+    ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), d <= 15 ? 3 : 2);
 
-  if (!ins.common_fault_risk.includes('signal_observation')) ins.common_fault_risk.push('signal_observation');
-  if (d <= 20 && !ins.common_fault_risk.includes('stop_line')) ins.common_fault_risk.push('stop_line');
+    if (!ins.common_fault_risk.includes('signal_observation')) ins.common_fault_risk.push('signal_observation');
+    if (d <= 20 && !ins.common_fault_risk.includes('stop_line')) ins.common_fault_risk.push('stop_line');
 
-  ins.stop_line_expected = d <= 20;
+    ins.stop_line_expected = d <= 20;
 
-  return;
-}
+    return;
+  }
 
   if (t === 'stop') {
-  const d = Number(nearest.dist_m ?? 999);
+    const d = Number(nearest.dist_m ?? 999);
 
-  if (!ins.hazard_tags.includes('stop')) ins.hazard_tags.push('stop');
+    if (!ins.hazard_tags.includes('stop')) ins.hazard_tags.push('stop');
 
-  ins.junction_type = 'stop';
-  ins.decision_point = d <= 30;
-  ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), 3);
+    ins.junction_type = 'stop';
+    ins.decision_point = d <= 30;
+    ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), 3);
 
-  if (!ins.common_fault_risk.includes('stop_line')) ins.common_fault_risk.push('stop_line');
+    if (!ins.common_fault_risk.includes('stop_line')) ins.common_fault_risk.push('stop_line');
 
-  ins.stop_line_expected = true;
-  ins.must_stop = d <= 30;
+    ins.stop_line_expected = true;
+    ins.must_stop = d <= 30;
 
-  return;
-}
+    return;
+  }
 
   if (t === 'give_way') {
     if (!ins.hazard_tags.includes('give_way')) ins.hazard_tags.push('give_way');
@@ -297,6 +455,35 @@ const applyControlTags = (ins: any, hits: Array<{ type: string; dist_m: number }
     if (!ins.common_fault_risk.includes('give_way')) ins.common_fault_risk.push('give_way');
   }
 };
+
+function applyZebraTags(ins: any) {
+  if (ins.nearest_zebra_crossing) {
+    const d = Number(ins.nearest_zebra_crossing?.dist_m ?? 999);
+
+    ins.zebra_crossing_dist_m = d;
+
+    if (d <= 15) ins.zebra_crossing_confidence = 0.9;
+    else if (d <= 30) ins.zebra_crossing_confidence = 0.7;
+    else if (d <= 60) ins.zebra_crossing_confidence = 0.5;
+    else ins.zebra_crossing_confidence = 0.3;
+
+    if (!Array.isArray(ins.hazard_tags)) ins.hazard_tags = []
+    if (!Array.isArray(ins.common_fault_risk)) ins.common_fault_risk = []
+
+    if (d <= 30) {
+      if (!ins.hazard_tags.includes('zebra_crossing')) ins.hazard_tags.push('zebra_crossing')
+      ins.zebra_crossing_source = 'osm'
+      ins.zebra_crossing_decision_point = true
+      ins.stop_line_expected = true
+      ins.hazard_score = Math.max(Number(ins.hazard_score ?? 0), 2)
+      if (!ins.common_fault_risk.includes('scan_for_pedestrians')) ins.common_fault_risk.push('scan_for_pedestrians')
+      if (!ins.common_fault_risk.includes('yield_to_pedestrians')) ins.common_fault_risk.push('yield_to_pedestrians')
+    }
+  } else {
+    ins.zebra_crossing_dist_m = null;
+    ins.zebra_crossing_confidence = null;
+  }
+}
 
 const computeReliability = (ins: any): number => {
   const src = String(ins?.speed_source ?? '');
@@ -417,9 +604,10 @@ async function run() {
 
   const colchesterRouteCoords: number[][] = [];
 
-  const payloadFile = resolveSeedFile('colchester_payload.json');
+  const defaultPayloadFile = resolveSeedFile('colchester_payload.json');
+  const zebraPayloadFile = resolveSeedFile('zebra_payload.json');
   const payloadJson: any[] | null =
-    payloadFile && fs.existsSync(payloadFile) ? JSON.parse(fs.readFileSync(payloadFile, 'utf8')) : null;
+    defaultPayloadFile && fs.existsSync(defaultPayloadFile) ? JSON.parse(fs.readFileSync(defaultPayloadFile, 'utf8')) : null;
 
   const routesDir = resolveSeedRoutesDir();
   if (routesDir && fs.existsSync(routesDir)) {
@@ -434,7 +622,12 @@ async function run() {
         const routeNumberMatch = base.match(/(\d+)/);
         const routeNumber = routeNumberMatch ? routeNumberMatch[1] : null;
 
-        const routeName = routeNumber ? `Colchester Test Route ${routeNumber}` : 'Colchester Test Route';
+        const routeName = routeNumber ? `Colchester Test Route ${routeNumber}` : base;
+
+        const isZebraSmoke = base.toLowerCase().includes('zebra');
+
+        const useZebraPayload = base.toLowerCase().includes('zebra smoke test');
+        const payloadFile = useZebraPayload ? zebraPayloadFile : defaultPayloadFile;
 
         const geojsonPath = path.join(routesDir, `${base}.geojson`);
         let geojsonContent: any = null;
@@ -468,14 +661,22 @@ async function run() {
         const dist = distanceMeters(coords);
         const duration = Math.round(dist / (30 * (1000 / 3600)));
 
-        const routePayload =
-          payloadJson && routeNumber
-            ? payloadJson.find((r: any) => r.route === Number(routeNumber)) ?? null
-            : null;
+        const routePayload = isZebraSmoke
+          ? (payloadFile && fs.existsSync(payloadFile) ? JSON.parse(fs.readFileSync(payloadFile, 'utf8')) : null)
+          : (payloadJson && routeNumber ? payloadJson.find((r: any) => r.route === Number(routeNumber)) ?? null : null);
 
-        if (routePayload?.instructions && coords.length) {
-          await applyOsmSpeedsToInstructions(osmSpeedService, coords, routePayload.instructions);
+        if (isZebraSmoke && !routePayload) {
+          throw new Error('Smoke test requires colchester_payload.json');
         }
+
+        if (routePayload && coords.length) {
+          const instructions = Array.isArray(routePayload) ? routePayload : routePayload.instructions;
+          await applyOsmSpeedsToInstructions(osmSpeedService, coords, instructions);
+        }
+
+        const p = routePayload || {};
+        const ins = Array.isArray(p.instructions) ? p.instructions : [];
+        const finalPayload = { ...p, instructions: ins };
 
         await routeRepo.save({
           centreId: savedCentres[0].id,
@@ -487,7 +688,7 @@ async function run() {
           geojson: geojsonToStore,
           gpx: gpxContent,
           bbox: bboxLocal,
-          payload: routePayload,
+          payload: finalPayload,
           version: 1,
           isActive: true,
         } as Route);

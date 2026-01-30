@@ -260,6 +260,45 @@ export class OsmSpeedService {
       osm_id: Number(r.osm_id),
     }));
   }
+
+  async findZebraCrossingsNearPoint(
+    lng: number,
+    lat: number,
+    radiusM = 60,
+    limit = 8,
+  ): Promise<Array<{ type: string; dist_m: number; osm_id: number }>> {
+    const sql = `
+      SELECT
+        osm_id,
+        'zebra_crossing' AS type,
+        ST_Distance(
+          way,
+          ST_Transform(ST_SetSRID(ST_Point($1, $2), 4326), 3857)
+        ) AS dist_m
+      FROM planet_osm_point
+      WHERE
+        highway = 'crossing'
+        AND (
+          (tags -> 'crossing') = 'zebra'
+          OR (tags -> 'crossing:markings') = 'zebra'
+        )
+        AND ST_DWithin(
+          way,
+          ST_Transform(ST_SetSRID(ST_Point($1, $2), 4326), 3857),
+          $3
+        )
+      ORDER BY dist_m ASC
+      LIMIT $4
+    `
+
+    const rows = await this.dataSource.query(sql, [lng, lat, radiusM, limit])
+
+    return (rows || []).map((r: any) => ({
+      type: r.type,
+      dist_m: Number(r.dist_m),
+      osm_id: Number(r.osm_id),
+    }))
+  }
 }
 
 export function parseOsmMaxspeedToMph(raw: any): number | null {
