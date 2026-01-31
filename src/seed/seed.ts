@@ -168,12 +168,19 @@ const applyOsmSpeedsToInstructions = async (
     const lng = c[0];
     const lat = c[1];
 
-    let speed = await osmSpeedService.getSpeedAtPoint(lng, lat, 150);
-    if (speed.mph == null) {
-      const snapM = Number(speed.snapped?.dist_m ?? 999);
-      if (speed.snapped && snapM <= 15) {
-        speed = await osmSpeedService.getSpeedAtPoint(lng, lat, 500);
+    let speed: any = { mph: null, snapped: null, matched: null, speed_source: null, speed_limit_confidence: null };
+
+    try {
+      speed = await osmSpeedService.getSpeedAtPoint(lng, lat, 150);
+      if (speed.mph == null) {
+        const snapM = Number(speed.snapped?.dist_m ?? 999);
+        if (speed.snapped && snapM <= 15) {
+          speed = await osmSpeedService.getSpeedAtPoint(lng, lat, 500);
+        }
       }
+    } catch (error) {
+      // OSM data not available, will fall back to road class inference
+      console.warn(`OSM speed lookup failed for instruction ${i}, falling back to road class inference`);
     }
 
     ins.snapped_to_road = !!speed.snapped;
@@ -225,7 +232,12 @@ const applyOsmSpeedsToInstructions = async (
       radius = 300;
       limit = 8;
     }
-    const controls = await osmSpeedService.findControlsNearPoint(lng, lat, radius, limit);
+    let controls: any[] = [];
+    try {
+      controls = await osmSpeedService.findControlsNearPoint(lng, lat, radius, limit);
+    } catch (error) {
+      console.warn(`OSM controls lookup failed for point (${lng}, ${lat}):`, (error as Error).message);
+    }
     ins.nearest_control = controls?.length ? controls[0] : null;
     if (!controls || controls.length === 0) {
         ins.nearest_control = null;
@@ -244,7 +256,12 @@ const applyOsmSpeedsToInstructions = async (
     for (const point of densified) {
       const lngP = point[0];
       const latP = point[1];
-      const zebras = await osmSpeedService.findZebraCrossingsNearPoint(lngP, latP, 60, 8);
+      let zebras: any[] = [];
+      try {
+        zebras = await osmSpeedService.findZebraCrossingsNearPoint(lngP, latP, 60, 8);
+      } catch (error) {
+        console.warn(`OSM zebra crossing lookup failed for point (${lngP}, ${latP}):`, (error as Error).message);
+      }
       if (zebras.length) {
         const nearest = zebras[0];
         if (nearest.dist_m < bestDist) {
@@ -566,6 +583,17 @@ const turnAngleDeg = (a: number[], b: number[], c: number[]) => {
 
 async function run() {
   await dataSource.initialize();
+
+  // Load sample OSM data for testing
+  console.log('Loading sample OSM data...');
+  const osmDataPath = path.resolve(__dirname, 'osm-sample-data.sql');
+  if (fs.existsSync(osmDataPath)) {
+    const osmSql = fs.readFileSync(osmDataPath, 'utf8');
+    await dataSource.query(osmSql);
+    console.log('Sample OSM data loaded successfully');
+  } else {
+    console.warn('OSM sample data file not found, OSM lookups will use fallbacks');
+  }
 
   const osmSpeedService = new OsmSpeedService(dataSource);
 
