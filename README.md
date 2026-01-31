@@ -84,7 +84,27 @@ curl -X POST http://localhost:3000/cashback/start -H "Authorization: Bearer $TOK
 - Redis is available if you want to add caching/rate limits later (container included but not required).
 - When running the API outside docker against the dockerized Postgres, change `DATABASE_URL` host to `localhost`.\n
 
-## Security
-- JWT secret configured via env (`JWT_SECRET`).
-- Passwords hashed with bcrypt.
-- Webhook signature validated; failing signatures return 401.
+## CI/CD Deployment
+
+The backend includes automated CI/CD deployment to Google Cloud Platform using GitHub Actions.
+
+### Setup
+1. Follow the detailed setup guide in [`CI-CD-SETUP.md`](./CI-CD-SETUP.md)
+2. Create GCP service account with appropriate permissions
+3. Add `GCP_SA_KEY` secret to GitHub repository
+4. Ensure your GCP VM has Node.js, PM2, and PostgreSQL client installed
+
+### How It Works
+- **Trigger**: Push to `main` branch affecting `backend/` directory
+- **Process**: Build → Test → Deploy to GCP VM
+- **Deployment**: Automatic dependency installation, database migration, and service restart
+
+### Monitoring
+```bash
+# Check deployment status
+pm2 status
+pm2 logs routemaster-backend
+
+# Test deployment
+curl https://your-vm-ip/docs
+```
