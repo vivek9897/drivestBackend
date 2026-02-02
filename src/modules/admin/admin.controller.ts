@@ -30,21 +30,13 @@ export class AdminController {
   async uploadRoute(
     @UploadedFile() file: any,
     @Body('centreId') centreId?: string,
-    @Body('centreName') centreName?: string,
-    @Body('postcode') postcode?: string,
     @Body('routeName') routeName?: string,
   ) {
     if (!file) throw new BadRequestException('GPX file is required');
-    if (!centreId && (!centreName || !postcode)) {
-      throw new BadRequestException('centreName and postcode are required when centreId is not provided');
-    }
-    if (!routeName) {
-      throw new BadRequestException('routeName is required');
-    }
+    if (!centreId) throw new BadRequestException('centreId is required. Please select a test centre first.');
+    
     const gpx = file.buffer.toString('utf8');
-    const route = await this.adminService.createRouteFromGpx(centreId || null, gpx, {
-      centreName,
-      postcode,
+    const route = await this.adminService.createRouteFromGpx(centreId, gpx, {
       routeName,
     });
     return { data: route };

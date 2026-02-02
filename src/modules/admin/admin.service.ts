@@ -5,6 +5,11 @@ import { User } from '../../entities/user.entity';
 import { TestCentre } from '../../entities/test-centre.entity';
 import { Route, RouteDifficulty } from '../../entities/route.entity';
 
+interface RouteCoordinate {
+  lat: number;
+  lon: number;
+}
+
 @Injectable()
 export class AdminService {
   constructor(
@@ -18,158 +23,143 @@ export class AdminService {
     return { users };
   }
 
+  /**
+   * Simplified Route LED approach:
+   * - Extract coordinates from GPX
+   * - Require centreId (no auto-creation)
+   * - Store only: coordinates, distance, duration
+   * - Skip: gpxHash, geojson, duplicate checking, gpx storage
+   */
   async createRouteFromGpx(
-    centreId: string | null,
+    centreId: string,
     gpx: string,
-    meta?: { centreName?: string; postcode?: string; routeName?: string },
+    meta?: { routeName?: string },
   ) {
+    if (!centreId) {
+      throw new BadRequestException('centreId is required. Centre must be created first via admin UI.');
+    }
+
+    // Verify centre exists
+    const centre = await this.centreRepo.findOne({ where: { id: centreId } });
+    if (!centre) throw new NotFoundException('Test centre not found');
+
+    // Extract coordinates from GPX
     const coords = this.coordsFromGpx(gpx);
-    if (!coords.length) throw new BadRequestException('No coordinates found in GPX');
+    if (!coords.length) throw new BadRequestException('No valid coordinates found in GPX file');
 
-    const centre = centreId
-      ? await this.centreRepo.findOne({ where: { id: centreId } })
-      : await this.findOrCreateCentreFromGpx(coords, meta);
-    if (!centre) throw new NotFoundException('Centre not found');
+    // Calculate metrics
+    const distanceM = this.calculateDistance(coords);
+    const durationEstS = Math.round((distanceM / 1000) * 5 * 60); // Assume 12 km/h average
 
-    const bbox = this.computeBbox(coords);
-    const distanceM = this.distanceMeters(coords);
-    const durationEstS = Math.round(distanceM / (30 * (1000 / 3600)));
+    // Generate route name
+    const existingCount = await this.routeRepo.count({ where: { centreId } });
+    const routeName = meta?.routeName?.trim() || `${centre.name} Route ${existingCount + 1}`;
 
-    const gpxHash = this.hashGpx(gpx);
-    const existingSame = await this.routeRepo.findOne({ where: { centreId: centre.id, gpxHash } as any });
-    if (existingSame) return existingSame;
-
-    const existingCount = await this.routeRepo.count({ where: { centreId: centre.id } });
-    const nextNum = existingCount + 1;
-    const baseName = centre.name;
-    const routeName = meta?.routeName?.trim()
-      ? meta.routeName.trim()
-      : `${baseName} ${nextNum}`;
-
-    const geojson = {
-      type: 'FeatureCollection',
-      features: [
-        {
-          type: 'Feature',
-          properties: { name: routeName, description: `Uploaded ${new Date().toISOString()}` },
-          geometry: { type: 'LineString', coordinates: coords },
-        },
-      ],
-    };
-
+    // Create route with simplified fields (Route LED approach)
     const route = this.routeRepo.create({
-      centreId: centre.id,
+      centreId,
       name: routeName,
-      distanceM: distanceM || 12000,
-      durationEstS: durationEstS || 2400,
+      distanceM: distanceM || 5000,
+      durationEstS: durationEstS || 1800,
       difficulty: RouteDifficulty.MEDIUM,
-      polyline: JSON.stringify(coords),
-      geojson,
-      gpx,
-      gpxHash,
-      bbox,
+      // IMPORTANT: New Route LED approach - store coordinates, not polyline/geojson/gpx
+      coordinates: coords.map(([lon, lat]) => ({ lat, lon })),
+      polyline: null, // Can be removed in future migration
+      geojson: null,  // Can be removed in future migration
+      gpx: null,      // Can be removed in future migration
+      gpxHash: null,  // Can be removed in future migration
       version: 1,
       isActive: true,
     });
+
     return this.routeRepo.save(route);
   }
 
-  private coordsFromGpx(gpx: string): number[][] {
+  /**
+   * Extract coordinates from GPX
+   * Returns array of [longitude, latitude] pairs (GeoJSON convention)
+   */
+  private coordsFromGpx(gpx: string): Array<[number, number]> {
+    // Try to find best track segment
     const segRegex = /<trkseg[^>]*>([\s\S]*?)<\/trkseg>/gi;
     let segMatch: RegExpExecArray | null;
-    let best: number[][] = [];
+    let bestSegment: Array<[number, number]> = [];
+
     while ((segMatch = segRegex.exec(gpx)) !== null) {
-      const seg = segMatch[1];
-      const pts: number[][] = [];
+      const segment = segMatch[1];
+      const points: Array<[number, number]> = [];
       const ptRegex = /<trkpt[^>]*lat="([0-9.+-]+)"[^>]*lon="([0-9.+-]+)"/g;
       let ptMatch: RegExpExecArray | null;
-      while ((ptMatch = ptRegex.exec(seg)) !== null) {
-        pts.push([Number(ptMatch[2]), Number(ptMatch[1])]); // [lng, lat]
+
+      while ((ptMatch = ptRegex.exec(segment)) !== null) {
+        const lat = Number(ptMatch[1]);
+        const lon = Number(ptMatch[2]);
+        // Validate coordinates
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        if (Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+        points.push([lon, lat]);
       }
-      if (pts.length > best.length) best = pts;
+
+      if (points.length > bestSegment.length) {
+        bestSegment = points;
+      }
     }
-    if (best.length) return best;
-    const all: number[][] = [];
+
+    if (bestSegment.length) return bestSegment;
+
+    // Fallback: parse all trkpt elements
+    const allPoints: Array<[number, number]> = [];
     const fallbackRegex = /<trkpt[^>]*lat="([0-9.+-]+)"[^>]*lon="([0-9.+-]+)"/g;
     let match: RegExpExecArray | null;
+
     while ((match = fallbackRegex.exec(gpx)) !== null) {
-      all.push([Number(match[2]), Number(match[1])]);
+      const lat = Number(match[1]);
+      const lon = Number(match[2]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      if (Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+      allPoints.push([lon, lat]);
     }
-    return all;
+
+    return allPoints;
   }
 
-  private async findOrCreateCentreFromGpx(
-    coords: number[][],
-    meta?: { centreName?: string; postcode?: string },
-  ) {
-    const centreName = meta?.centreName?.trim() || 'Unknown Test Centre';
-    const existing = await this.centreRepo.findOne({
-      where: { name: ILike(centreName) },
-    });
-    if (existing) return existing;
-
-    const [lng, lat] = coords[0];
-    const insertResult = await this.centreRepo.query(
-      `INSERT INTO test_centres (name, address, postcode, city, country, lat, lng, geo)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, ST_SetSRID(ST_MakePoint($7, $6), 4326))
-       RETURNING *`,
-      [
-        centreName,
-        'Uploaded GPX route',
-        meta?.postcode?.trim() || 'UNKNOWN',
-        centreName,
-        'UK',
-        lat,
-        lng,
-      ],
-    );
-    return insertResult[0] as TestCentre;
-  }
-
-  // centre name and postcode are required via admin UI when creating a new centre
-
-  private computeBbox(coords: number[][]) {
-    const box = coords.reduce(
-      (acc, [lng, lat]) => ({
-        minLat: Math.min(acc.minLat, lat),
-        maxLat: Math.max(acc.maxLat, lat),
-        minLng: Math.min(acc.minLng, lng),
-        maxLng: Math.max(acc.maxLng, lng),
-      }),
-      { minLat: 90, maxLat: -90, minLng: 180, maxLng: -180 },
-    );
-    return { minLat: box.minLat, maxLat: box.maxLat, minLng: box.minLng, maxLng: box.maxLng };
-  }
-
-  private distanceMeters(coords: number[][]) {
+  /**
+   * Calculate distance using Haversine formula
+   */
+  private calculateDistance(coords: Array<[number, number]>): number {
     if (coords.length < 2) return 0;
-    let d = 0;
+
+    let totalDistance = 0;
     for (let i = 0; i < coords.length - 1; i++) {
-      d += this.haversine(coords[i], coords[i + 1]);
+      totalDistance += this.haversine(coords[i], coords[i + 1]);
     }
-    return Math.round(d);
+
+    return Math.round(totalDistance);
   }
 
-  private haversine(a: number[], b: number[]) {
-    const toRad = (d: number) => (d * Math.PI) / 180;
-    const R = 6371000;
-    const dLat = toRad(b[1] - a[1]);
-    const dLon = toRad(b[0] - a[0]);
-    const lat1 = toRad(a[1]);
-    const lat2 = toRad(b[1]);
-    const sinDLat = Math.sin(dLat / 2);
-    const sinDLon = Math.sin(dLon / 2);
-    const c =
-      2 *
-      Math.atan2(
-        Math.sqrt(sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon * sinDLon),
-        Math.sqrt(1 - (sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon * sinDLon)),
-      );
-    return R * c;
-  }
+  /**
+   * Haversine formula to calculate distance between two points
+   * Input: [longitude, latitude]
+   */
+  private haversine(from: [number, number], to: [number, number]): number {
+    const toRad = (degrees: number) => (degrees * Math.PI) / 180;
+    const earthRadius = 6371000; // meters
 
-  private hashGpx(gpx: string) {
-    const crypto = require('crypto');
-    return crypto.createHash('sha256').update(gpx).digest('hex');
+    const [lon1, lat1] = from;
+    const [lon2, lat2] = to;
+
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(lat1)) *
+        Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
+
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    return earthRadius * c;
   }
 }

@@ -44,8 +44,14 @@ export class Route {
   } as any)
   difficulty: RouteDifficulty;
 
-  @Column('text')
-  polyline: string;
+  @Column('text', { nullable: true })
+  polyline: string | null;
+
+  @Column({
+    type: process.env.NODE_ENV === 'test' ? 'simple-json' : 'jsonb',
+    nullable: true,
+  } as any)
+  coordinates: any[] | null;
 
   @Column({
     type: process.env.NODE_ENV === 'test' ? 'simple-json' : 'jsonb',
