@@ -6,6 +6,7 @@ import { Product, ProductPeriod, ProductType } from '../entities/product.entity'
 import { OsmSpeedService } from '../modules/routes/osm-speed.service';
 import { inferSpeedFromRoadClassMph } from '../modules/routes/speed-fallback';
 import { computeBendAdvisoryMph } from '../modules/routes/advisory-speed';
+import { enrichColchesterRoutes, computeBbox as seedComputeBbox } from './colchester-routes-seed';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -637,6 +638,68 @@ async function run() {
   const payloadJson: any[] | null =
     defaultPayloadFile && fs.existsSync(defaultPayloadFile) ? JSON.parse(fs.readFileSync(defaultPayloadFile, 'utf8')) : null;
 
+  // Load Colchester routes from hardcoded coordinates
+  const enrichedColchesterRoutes = enrichColchesterRoutes();
+  
+  for (const seedRoute of enrichedColchesterRoutes) {
+    try {
+      const coords = seedRoute.coordinates;
+      const bboxLocal = seedComputeBbox(coords);
+      const polyline = JSON.stringify(coords);
+
+      const geojsonToStore = {
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            properties: { name: seedRoute.name },
+            geometry: { type: 'LineString', coordinates: coords },
+          },
+        ],
+      };
+
+      const dist = seedRoute.distance || 12000;
+      const duration = seedRoute.duration || 2400;
+
+      const routePayload = payloadJson
+        ? payloadJson.find((r: any) => {
+            const routeNum = seedRoute.name.match(/(\d+)/)?.[1];
+            return routeNum && r.route === Number(routeNum);
+          }) ?? null
+        : null;
+
+      if (routePayload && coords.length) {
+        const instructions = Array.isArray(routePayload) ? routePayload : routePayload.instructions;
+        await applyOsmSpeedsToInstructions(osmSpeedService, coords, instructions);
+      }
+
+      const p = routePayload || {};
+      const ins = Array.isArray(p.instructions) ? p.instructions : [];
+      const finalPayload = { ...p, instructions: ins };
+
+      await routeRepo.save({
+        centreId: savedCentres[0].id,
+        name: seedRoute.name,
+        distanceM: dist,
+        durationEstS: duration,
+        difficulty: seedRoute.difficulty,
+        polyline,
+        geojson: geojsonToStore,
+        gpx: null, // No GPX for coordinate-based routes
+        bbox: bboxLocal,
+        coordinates: coords,
+        payload: finalPayload,
+        version: 1,
+        isActive: true,
+      } as Route);
+
+      console.log(`Created route ${seedRoute.name} with ${coords.length} coordinate points`);
+    } catch (err) {
+      console.warn(`Failed to create route ${seedRoute.name}:`, err);
+    }
+  }
+
+  // Optional: Still load any GPX files from the routes directory (for backward compatibility)
   const routesDir = resolveSeedRoutesDir();
   if (routesDir && fs.existsSync(routesDir)) {
     const files = fs.readdirSync(routesDir);
