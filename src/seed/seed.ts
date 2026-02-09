@@ -644,7 +644,9 @@ async function run() {
   for (const seedRoute of enrichedColchesterRoutes) {
     try {
       const coords = seedRoute.coordinates;
-      const bboxLocal = seedComputeBbox(coords);
+      const bboxObj = seedComputeBbox(coords);
+      // Convert bbox object to array format [minLng, minLat, maxLng, maxLat]
+      const bboxLocal = [bboxObj.minLng, bboxObj.minLat, bboxObj.maxLng, bboxObj.maxLat];
       const polyline = JSON.stringify(coords);
 
       const geojsonToStore = {
@@ -731,7 +733,9 @@ async function run() {
         if (!coords.length) coords = coordsFromGpx(gpxContent);
         if (!coords.length) coords = colchesterRouteCoords;
 
-        const bboxLocal = computeBbox(coords);
+        const bboxObj = computeBbox(coords);
+        // Convert bbox object to array format [minLng, minLat, maxLng, maxLat]
+        const bboxLocal = [bboxObj.minLng, bboxObj.minLat, bboxObj.maxLng, bboxObj.maxLat];
         const polyline = JSON.stringify(coords);
 
         const geojsonToStore =

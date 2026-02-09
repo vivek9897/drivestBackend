@@ -128,8 +128,14 @@ export class CentresService {
   }
 
   async routesForCentre(id: string) {
-    return this.routesRepo.find({
+    const routes = await this.routesRepo.find({
       where: { centreId: id, isActive: true },
-    })
+    });
+    
+    // Remove gpx field from each route before returning
+    return routes.map(route => {
+      const { gpx, ...routeWithoutGpx } = route;
+      return routeWithoutGpx;
+    });
   }
 }

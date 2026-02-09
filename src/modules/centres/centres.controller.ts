@@ -21,6 +21,6 @@ export class CentresController {
 
   @Get(':id/routes')
   async routes(@Param('id') id: string) {
-    return this.centresService.routesForCentre(id);
+    return await this.centresService.routesForCentre(id);
   }
 }
